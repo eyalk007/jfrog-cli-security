@@ -1,4 +1,4 @@
-name: Mirror to self-hosted GitHub
+name: Mirror to self-hosted GitHub (HTTPS)
 
 on:
   push:
@@ -12,17 +12,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Set up SSH
+    - name: Mirror repository via HTTPS
+      env:
+        SELF_HOSTED_GITHUB_HOST: ${{ secrets.SELF_HOSTED_GITHUB_HOST }}
+        SELF_HOSTED_REPO_HTTPS_URL: ${{ secrets.SELF_HOSTED_REPO_HTTPS_URL }}
+        PAT: ${{ secrets.PAT }}
       run: |
-        mkdir -p ~/.ssh
-        printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        ssh-keyscan ${{ secrets.SELF_HOSTED_GITHUB_HOST }} >> ~/.ssh/known_hosts
-        ssh -T git@${{ secrets.SELF_HOSTED_GITHUB_HOST }}
-
-    - name: Mirror repository
-      run: |
+        # Clone source repo as mirror (read-only, usually no auth needed)
         git clone --mirror https://github.com/jfrog/jfrog-cli-security.git
         cd jfrog-cli-security.git
-        git remote set-url origin ${{ secrets.SELF_HOSTED_REPO_SSH_URL }}
+
+        # Rewrite origin URL with PAT for authentication
+        # Insert token into the HTTPS URL: https://<PAT>@hostname/user/repo.git
+        # Ensure SELF_HOSTED_REPO_HTTPS_URL is like: https://github.jfrog.info/user/repo.git
+        AUTHENTICATED_URL=$(echo "$SELF_HOSTED_REPO_HTTPS_URL" | sed -e "s#https://#https://$PAT@#")
+
+        git remote set-url origin "$AUTHENTICATED_URL"
+
+        # Push all refs to self-hosted repo
         git push --mirror
