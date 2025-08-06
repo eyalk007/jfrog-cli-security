@@ -19,7 +19,7 @@ jobs:
         PAT: ${{ secrets.PAT }}
       run: |
         # Clone source repo as mirror (read-only, usually no auth needed)
-        git clone --mirror https://github.com/jfrog/jfrog-cli-security.git
+        git clone --branch main --branch dev --single-branch --no-tags https://github.com/jfrog/jfrog-cli-security.git repo
         cd jfrog-cli-security.git
 
         # Rewrite origin URL with PAT for authentication
