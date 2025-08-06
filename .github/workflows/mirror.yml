@@ -15,6 +15,7 @@ jobs:
     - name: Set up SSH
       run: |
         mkdir -p ~/.ssh
+        ssh -T git@github.jfrog.info
         printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
         chmod 600 ~/.ssh/id_rsa
         ssh-keyscan ${{ secrets.SELF_HOSTED_GITHUB_HOST }} >> ~/.ssh/known_hosts
