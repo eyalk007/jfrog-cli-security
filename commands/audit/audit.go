@@ -11,6 +11,7 @@ import (
 	"github.com/jfrog/jfrog-cli-core/v2/common/format"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/coreutils"
+	"github.com/jfrog/jfrog-cli-security/commands/upload"
 	"github.com/jfrog/jfrog-cli-security/jas"
 	"github.com/jfrog/jfrog-cli-security/jas/applicability"
 	"github.com/jfrog/jfrog-cli-security/jas/runner"
@@ -25,6 +26,7 @@ import (
 	"github.com/jfrog/jfrog-cli-security/sca/scan"
 	"github.com/jfrog/jfrog-cli-security/utils"
 	"github.com/jfrog/jfrog-cli-security/utils/results"
+	"github.com/jfrog/jfrog-cli-security/utils/results/conversion"
 	"github.com/jfrog/jfrog-cli-security/utils/results/output"
 	"github.com/jfrog/jfrog-cli-security/utils/techutils"
 
@@ -641,6 +643,31 @@ func createJasScansTask(auditParallelRunner *utils.SecurityParallelRunner, scanR
 		}
 		return
 	}
+}
+
+// UploadUnifiedResults - Upload unified SCA+JAS diff results using CDX format
+func UploadUnifiedResults(scaResults, jasDiffResults *results.SecurityCommandResults, serverDetails *config.ServerDetails) error {
+	// First unify SCA and JAS diff results
+	unifiedResults := results.UnifyScaAndJasResults(scaResults, jasDiffResults)
+
+	// Convert unified results to CycloneDX format (new architecture)
+	convertor := conversion.NewCommandResultsConvertor(conversion.ResultConvertParams{
+		IncludeVulnerabilities: true,
+		HasViolationContext:    false,
+	})
+
+	cdxBom, err := convertor.ConvertToCycloneDx(unifiedResults)
+	if err != nil {
+		return fmt.Errorf("failed to convert unified results to CycloneDX: %w", err)
+	}
+
+	// Upload using new CDX upload command
+	uploadCmd := upload.NewUploadCycloneDxCommand().
+		SetContentToUpload(cdxBom).
+		SetServerDetails(serverDetails).
+		SetFilePrefix("frogbot-unified-diff")
+
+	return uploadCmd.Run()
 }
 
 func getSignedDescriptions(currentFormat format.OutputFormat) bool {

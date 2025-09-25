@@ -3,6 +3,8 @@ package results
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -650,4 +652,402 @@ func (jsr *JasScansResults) HasInformationByType(scanType jasutils.JasScanType) 
 		}
 	}
 	return false
+}
+
+// UnifyScaAndJasResults - Merge SCA results into JAS diff results for complete SecurityCommandResults
+func UnifyScaAndJasResults(scaResults, jasDiffResults *SecurityCommandResults) *SecurityCommandResults {
+	// Create unified results based on JAS diff structure
+	unifiedResults := &SecurityCommandResults{
+		EntitledForJas:   jasDiffResults.EntitledForJas,
+		SecretValidation: jasDiffResults.SecretValidation,
+		CmdType:          jasDiffResults.CmdType,
+		XrayVersion:      jasDiffResults.XrayVersion,
+		XscVersion:       jasDiffResults.XscVersion,
+		MultiScanId:      jasDiffResults.MultiScanId,
+		StartTime:        jasDiffResults.StartTime,
+		ResultContext:    jasDiffResults.ResultContext,
+	}
+
+	// Merge targets from both SCA and JAS results
+	for _, scaTarget := range scaResults.Targets {
+		// Find corresponding JAS target
+		var jasTarget *TargetResults
+		for _, jTarget := range jasDiffResults.Targets {
+			if jTarget.Target == scaTarget.Target {
+				jasTarget = jTarget
+				break
+			}
+		}
+
+		// Create unified target with both SCA and JAS results
+		unifiedTarget := &TargetResults{
+			ScanTarget:       scaTarget.ScanTarget,
+			AppsConfigModule: scaTarget.AppsConfigModule,
+			ScaResults:       scaTarget.ScaResults, // Take SCA results from source
+			JasResults:       nil,                  // Will set from JAS diff
+		}
+
+		// Add JAS diff results if available
+		if jasTarget != nil {
+			unifiedTarget.JasResults = jasTarget.JasResults
+		}
+
+		unifiedResults.Targets = append(unifiedResults.Targets, unifiedTarget)
+	}
+
+	return unifiedResults
+}
+
+// CompareJasResults - Compare two SecurityCommandResults and return diff results (in-memory diff using AM logic)
+func CompareJasResults(targetResults, sourceResults *SecurityCommandResults) *SecurityCommandResults {
+	log.Info("[DIFF] Starting JAS diff calculation")
+	log.Info("[DIFF] Comparing", len(sourceResults.Targets), "source targets against", len(targetResults.Targets), "target targets")
+	log.Debug("[DIFF] Target results:", len(targetResults.Targets), "targets")
+	log.Debug("[DIFF] Source results:", len(sourceResults.Targets), "targets")
+
+	// Create diff results based on source structure
+	diffResults := &SecurityCommandResults{
+		EntitledForJas:   sourceResults.EntitledForJas,
+		SecretValidation: sourceResults.SecretValidation,
+		CmdType:          sourceResults.CmdType,
+		XrayVersion:      sourceResults.XrayVersion,
+		XscVersion:       sourceResults.XscVersion,
+		MultiScanId:      sourceResults.MultiScanId,
+		StartTime:        sourceResults.StartTime,
+		ResultContext:    sourceResults.ResultContext,
+	}
+
+	log.Debug("[DIFF] Created diff results structure")
+
+	// Compare each source target against ALL target targets using AM's exact diff logic
+	log.Debug("[DIFF] Starting target-by-target comparison")
+	for i, sourceTarget := range sourceResults.Targets {
+		log.Debug("[DIFF] Processing source target", i+1, "of", len(sourceResults.Targets), "- ScanTarget:", sourceTarget.ScanTarget)
+		if sourceTarget.JasResults == nil {
+			log.Debug("[DIFF] Skipping source target", i+1, "- no JAS results")
+			continue
+		}
+
+		// Simple nested loop: collect ALL target JAS results to compare against
+		var allTargetJasResults []*JasScansResults
+		log.Debug("[DIFF] Collecting target JAS results from", len(targetResults.Targets), "target targets")
+		for j, targetTarget := range targetResults.Targets {
+			if targetTarget.JasResults != nil {
+				log.Debug("[DIFF] Adding target", j+1, "JAS results to comparison set - ScanTarget:", targetTarget.ScanTarget)
+				allTargetJasResults = append(allTargetJasResults, targetTarget.JasResults)
+			} else {
+				log.Debug("[DIFF] Skipping target", j+1, "- no JAS results")
+			}
+		}
+		log.Debug("[DIFF] Collected", len(allTargetJasResults), "target JAS results for comparison")
+
+		// Apply AM's diff logic against all collected targets
+		log.Debug("[DIFF] Applying AM diff logic for source target:", sourceTarget.ScanTarget)
+		diffJasResults := applyAmDiffLogicAgainstAll(allTargetJasResults, sourceTarget.JasResults)
+
+		diffTarget := &TargetResults{
+			ScanTarget: sourceTarget.ScanTarget,
+			JasResults: diffJasResults,
+		}
+
+		diffResults.Targets = append(diffResults.Targets, diffTarget)
+		log.Debug("[DIFF] Added diff target to results - ScanTarget:", sourceTarget.ScanTarget)
+	}
+
+	log.Info("[DIFF] JAS diff calculation completed with", len(diffResults.Targets), "diff targets")
+	log.Debug("[DIFF] JAS diff calculation completed with", len(diffResults.Targets), "targets")
+	return diffResults
+}
+
+// Apply analyzer manager's diff logic against ALL target results
+func applyAmDiffLogicAgainstAll(allTargetJasResults []*JasScansResults, sourceJasResults *JasScansResults) *JasScansResults {
+	log.Debug("[DIFF-AM] Starting AM diff logic")
+	if sourceJasResults == nil {
+		log.Debug("[DIFF-AM] Source JAS results is nil, returning nil")
+		return nil
+	}
+
+	// If no target results, return all source results (no diff needed)
+	if len(allTargetJasResults) == 0 {
+		log.Debug("[DIFF-AM] No target results, returning all source results")
+		return sourceJasResults
+	}
+
+	log.Debug("[DIFF-AM] Processing", len(allTargetJasResults), "target JAS results against source")
+
+	// Build target fingerprint set from ALL target results
+	targetKeys := make(map[string]bool)
+
+	// Extract from ALL target results
+	log.Debug("[DIFF-AM] Building target fingerprint set from all target results")
+	for i, targetJasResults := range allTargetJasResults {
+		if targetJasResults == nil {
+			log.Debug("[DIFF-AM] Skipping target JAS result", i+1, "- nil results")
+			continue
+		}
+		log.Debug("[DIFF-AM] Processing target JAS result", i+1, "of", len(allTargetJasResults))
+
+		// Extract from target secrets results (NO fingerprints - only location)
+		for _, targetRun := range targetJasResults.GetVulnerabilitiesResults(jasutils.Secrets) {
+			extractLocationsOnly(targetRun, targetKeys)
+		}
+		for _, targetRun := range targetJasResults.GetViolationsResults(jasutils.Secrets) {
+			extractLocationsOnly(targetRun, targetKeys)
+		}
+		// Extract from target iac results (NO fingerprints - only location)
+		for _, targetRun := range targetJasResults.GetVulnerabilitiesResults(jasutils.IaC) {
+			extractLocationsOnly(targetRun, targetKeys)
+		}
+		for _, targetRun := range targetJasResults.GetViolationsResults(jasutils.IaC) {
+			extractLocationsOnly(targetRun, targetKeys)
+		}
+		// Extract from target sast results (WITH fingerprints)
+		for _, targetRun := range targetJasResults.GetVulnerabilitiesResults(jasutils.Sast) {
+			extractFingerprints(targetRun, targetKeys)
+		}
+		for _, targetRun := range targetJasResults.GetViolationsResults(jasutils.Sast) {
+			extractFingerprints(targetRun, targetKeys)
+		}
+	}
+
+	// Filter source results using target fingerprints (same as AM)
+	log.Info("[DIFF-AM] Built target fingerprint set with", len(targetKeys), "unique keys")
+	log.Debug("[DIFF-AM] Target fingerprint set built with", len(targetKeys), "unique keys")
+	log.Debug("[DIFF-AM] Starting source results filtering")
+	filteredJasResults := &JasScansResults{}
+
+	// Filter vulnerabilities
+	filteredJasResults.JasVulnerabilities.SecretsScanResults = filterScanResults(
+		sourceJasResults.JasVulnerabilities.SecretsScanResults, targetKeys)
+	filteredJasResults.JasVulnerabilities.IacScanResults = filterScanResults(
+		sourceJasResults.JasVulnerabilities.IacScanResults, targetKeys)
+	filteredJasResults.JasVulnerabilities.SastScanResults = filterScanResults(
+		sourceJasResults.JasVulnerabilities.SastScanResults, targetKeys)
+
+	// Filter violations (same logic as vulnerabilities)
+	filteredJasResults.JasViolations.SecretsScanResults = filterScanResults(
+		sourceJasResults.JasViolations.SecretsScanResults, targetKeys)
+	filteredJasResults.JasViolations.IacScanResults = filterScanResults(
+		sourceJasResults.JasViolations.IacScanResults, targetKeys)
+	filteredJasResults.JasViolations.SastScanResults = filterScanResults(
+		sourceJasResults.JasViolations.SastScanResults, targetKeys)
+
+	log.Info("[DIFF-AM] Source filtering completed")
+	log.Debug("[DIFF-AM] Returning filtered JAS results")
+	return filteredJasResults
+}
+
+// Apply analyzer manager's diff logic in memory (same algorithm as AM but on SecurityCommandResults)
+func applyAmDiffLogic(targetJasResults, sourceJasResults *JasScansResults) *JasScansResults {
+	if sourceJasResults == nil {
+		return nil
+	}
+
+	// If no target results, return all source results (no diff needed)
+	if targetJasResults == nil {
+		return sourceJasResults
+	}
+
+	// Build target fingerprint set from all scan types (same as AM)
+	targetKeys := make(map[string]bool)
+
+	// Extract from target secrets results (NO fingerprints - only location)
+	for _, targetRun := range targetJasResults.GetVulnerabilitiesResults(jasutils.Secrets) {
+		extractLocationsOnly(targetRun, targetKeys)
+	}
+	for _, targetRun := range targetJasResults.GetViolationsResults(jasutils.Secrets) {
+		extractLocationsOnly(targetRun, targetKeys)
+	}
+	// Extract from target iac results (NO fingerprints - only location)
+	for _, targetRun := range targetJasResults.GetVulnerabilitiesResults(jasutils.IaC) {
+		extractLocationsOnly(targetRun, targetKeys)
+	}
+	for _, targetRun := range targetJasResults.GetViolationsResults(jasutils.IaC) {
+		extractLocationsOnly(targetRun, targetKeys)
+	}
+	// Extract from target sast results (WITH fingerprints)
+	for _, targetRun := range targetJasResults.GetVulnerabilitiesResults(jasutils.Sast) {
+		extractFingerprints(targetRun, targetKeys)
+	}
+	for _, targetRun := range targetJasResults.GetViolationsResults(jasutils.Sast) {
+		extractFingerprints(targetRun, targetKeys)
+	}
+
+	// Filter source results using target fingerprints (same as AM)
+	filteredJasResults := &JasScansResults{}
+
+	// Filter vulnerabilities
+	filteredJasResults.JasVulnerabilities.SecretsScanResults = filterScanResults(
+		sourceJasResults.JasVulnerabilities.SecretsScanResults, targetKeys)
+	filteredJasResults.JasVulnerabilities.IacScanResults = filterScanResults(
+		sourceJasResults.JasVulnerabilities.IacScanResults, targetKeys)
+	filteredJasResults.JasVulnerabilities.SastScanResults = filterScanResults(
+		sourceJasResults.JasVulnerabilities.SastScanResults, targetKeys)
+
+	// Filter violations (same logic as vulnerabilities)
+	filteredJasResults.JasViolations.SecretsScanResults = filterScanResults(
+		sourceJasResults.JasViolations.SecretsScanResults, targetKeys)
+	filteredJasResults.JasViolations.IacScanResults = filterScanResults(
+		sourceJasResults.JasViolations.IacScanResults, targetKeys)
+	filteredJasResults.JasViolations.SastScanResults = filterScanResults(
+		sourceJasResults.JasViolations.SastScanResults, targetKeys)
+
+	return filteredJasResults
+}
+
+// Extract fingerprints from SARIF run (ONLY for SAST)
+func extractFingerprints(run *sarif.Run, targetKeys map[string]bool) {
+	for _, result := range run.Results {
+		if result.Fingerprints != nil {
+			// Use AM's EXACT logic - only look for SAST fingerprint
+			key := getResultFingerprint(result)
+			if key != "" {
+				targetKeys[key] = true
+			}
+		} else {
+			// Use AM's exact location logic
+			for _, location := range result.Locations {
+				key := getRelativeLocationFileName(location, run.Invocations) + getLocationSnippetText(location)
+				targetKeys[key] = true
+			}
+		}
+	}
+}
+
+// Extract locations only (for secrets and IaC - no fingerprints)
+func extractLocationsOnly(run *sarif.Run, targetKeys map[string]bool) {
+	for _, result := range run.Results {
+		// Always use location logic for secrets/IaC (ignore fingerprints)
+		for _, location := range result.Locations {
+			key := getRelativeLocationFileName(location, run.Invocations) + getLocationSnippetText(location)
+			targetKeys[key] = true
+		}
+	}
+}
+
+// EXACT copy of AM's getResultFingerprint function
+func getResultFingerprint(result *sarif.Result) string {
+	if result.Fingerprints != nil {
+		if value, ok := result.Fingerprints["precise_sink_and_sink_function"]; ok { // SastFingerprintKey
+			return value
+		}
+	}
+	return ""
+}
+
+// EXACT copy of AM's getLocationSnippetText function
+func getLocationSnippetText(location *sarif.Location) string {
+	if location.PhysicalLocation != nil && location.PhysicalLocation.Region != nil &&
+		location.PhysicalLocation.Region.Snippet != nil && location.PhysicalLocation.Region.Snippet.Text != nil {
+		return *location.PhysicalLocation.Region.Snippet.Text
+	}
+	return ""
+}
+
+// FIXED: getSourceRelativeLocationFileName should also remove temp directories
+func getSourceRelativeLocationFileName(location *sarif.Location, invocations []*sarif.Invocation) string {
+	// Use same logic as getRelativeLocationFileName
+	wd := ""
+	if len(invocations) > 0 {
+		wd = getInvocationWorkingDirectory(invocations[0])
+	}
+	filePath := getLocationFileName(location)
+	if filePath != "" {
+		return extractRelativePath(filePath, wd)
+	}
+	return ""
+}
+
+// EXACT copy of AM's getRelativeLocationFileName function (for target)
+func getRelativeLocationFileName(location *sarif.Location, invocations []*sarif.Invocation) string {
+	wd := ""
+	if len(invocations) > 0 {
+		wd = getInvocationWorkingDirectory(invocations[0])
+	}
+	filePath := getLocationFileName(location)
+	if filePath != "" {
+		return extractRelativePath(filePath, wd)
+	}
+	return ""
+}
+
+func getInvocationWorkingDirectory(invocation *sarif.Invocation) string {
+	if invocation != nil && invocation.WorkingDirectory != nil && invocation.WorkingDirectory.URI != nil {
+		return *invocation.WorkingDirectory.URI
+	}
+	return ""
+}
+
+func getLocationFileName(location *sarif.Location) string {
+	if location != nil && location.PhysicalLocation != nil && location.PhysicalLocation.ArtifactLocation != nil && location.PhysicalLocation.ArtifactLocation.URI != nil {
+		return *location.PhysicalLocation.ArtifactLocation.URI
+	}
+	return ""
+}
+
+func extractRelativePath(resultPath string, projectRoot string) string {
+	// Remove OS-specific file prefix
+	resultPath = strings.TrimPrefix(resultPath, "file:///private")
+	resultPath = strings.TrimPrefix(resultPath, "file:///")
+	projectRoot = strings.TrimPrefix(projectRoot, "file:///private")
+	projectRoot = strings.TrimPrefix(projectRoot, "file:///")
+
+	// In ubuntu the project root has 4 slashes
+	projectRoot = strings.TrimPrefix(projectRoot, "/")
+
+	// Get relative path (removes temp directory!)
+	relativePath := strings.ReplaceAll(resultPath, projectRoot, "")
+	trimSlash := strings.TrimPrefix(relativePath, string(filepath.Separator))
+	return strings.TrimPrefix(trimSlash, "/")
+}
+
+// Filter scan results using target keys (EXACT same logic as AM)
+func filterScanResults(sourceScanResults []ScanResult[[]*sarif.Run], targetKeys map[string]bool) []ScanResult[[]*sarif.Run] {
+	var filteredResults []ScanResult[[]*sarif.Run]
+
+	for _, sourceScan := range sourceScanResults {
+		var filteredRuns []*sarif.Run
+		for _, run := range sourceScan.Scan {
+			var filteredScanResults []*sarif.Result
+
+			// Apply AM's exact filtering logic (lines 53-76 in DiffScanService)
+			for _, result := range run.Results {
+				if result.Fingerprints != nil {
+					// Use AM's exact fingerprint logic
+					if !targetKeys[getResultFingerprint(result)] {
+						filteredScanResults = append(filteredScanResults, result)
+					}
+				} else {
+					// Use AM's exact location filtering logic
+					var filteredLocations []*sarif.Location
+					for _, location := range result.Locations {
+						key := getSourceRelativeLocationFileName(location, run.Invocations) + getLocationSnippetText(location)
+						if !targetKeys[key] {
+							filteredLocations = append(filteredLocations, location)
+						}
+					}
+
+					if len(filteredLocations) > 0 {
+						newResult := *result // Copy result
+						newResult.Locations = filteredLocations
+						filteredScanResults = append(filteredScanResults, &newResult)
+					}
+				}
+			}
+
+			if len(filteredScanResults) > 0 {
+				filteredRun := *run
+				filteredRun.Results = filteredScanResults
+				filteredRuns = append(filteredRuns, &filteredRun)
+			}
+		}
+
+		if len(filteredRuns) > 0 {
+			filteredScan := sourceScan
+			filteredScan.Scan = filteredRuns
+			filteredResults = append(filteredResults, filteredScan)
+		}
+	}
+
+	return filteredResults
 }
